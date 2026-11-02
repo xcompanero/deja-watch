@@ -21,6 +21,10 @@ and Deja Dup's schedule and settings are never touched.
 | 2. Backing up           | `deja-watch live`  | A real verbose backup with restic's native interactive progress bar (files, bytes, rate). Asks for confirmation first. |
 | 3. Changed files        | `deja-watch diff`  | Grouped **MODIFIED / ADDED / REMOVED** file lists plus restic's byte summary between the last two snapshots. Read-only. |
 
+Stage 3 — `deja-watch diff` — in action (file names shown are anonymized):
+
+![Terminal window showing deja-watch diff: MODIFIED, ADDED and REMOVED file lists with a restic byte summary](docs/deja-watch-diff.png)
+
 ## Commands
 
 ```

@@ -1,0 +1,6 @@
+# Local-only material — never publish
+_private/
+deja-watch-session-notes-*.md
+*.log
+snapshot-test.log
+scan-test.log

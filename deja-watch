@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+# deja-watch — on-demand terminal monitor for Deja Dup (restic engine) backups.
+#
+# Copyright (C) 2026 xcompanero
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Deja Dup 50 hides the detail older versions showed. This tool reads your
+# existing Deja Dup settings (gsettings) and talks to the same repository,
+# restoring the classic three stages:
+#
+#   Stage 1 (Scanning):        deja-watch scan   (dry run, writes nothing)
+#   Stage 2 (Backing-up):      deja-watch live   (real backup, verbose progress)
+#   Stage 3 (Changed files):   deja-watch diff
+#
+# It never changes Deja Dup's schedule or settings.
+#
+# Usage:
+#   deja-watch status            repository, mount and last snapshot overview
+#   deja-watch scan              stage 1: scan what would be backed up (dry run)
+#   deja-watch live [extra...]   stage 2: full verbose backup (creates a real snapshot)
+#   deja-watch diff [n]          stage 3: files added/changed/removed vs previous snapshot
+#                                (n = compare against the snapshot n steps back, default 1)
+#   deja-watch history [n]       list the last n snapshots (default 8)
+#   deja-watch tap               while a scheduled Deja Dup run is active, print the
+#                                exact restic command Deja Dup is executing
+#   deja-watch env               print the resolved settings (debug)
+#   deja-watch help              this text
+#
+# Extra args to 'live' are passed through to restic (e.g. --exclude '*.vdi').
+# Set DEJA_WATCH_PASSWORD to use a password-protected repo instead of the
+# passwordless one Deja Dup configured (env-declared, use with export).
+
+set -euo pipefail
+
+GS_HOME="org.gnome.DejaDup"
+
+# ---------------------------------------------------------------- helpers ---
+
+die() { echo "deja-watch: $*" >&2; exit 1; }
+
+gs_list() {  # expand a gsettings string list into one path per line
+    gsettings get "$GS_HOME" "$1" | python3 -c '
+import sys, ast, os, subprocess
+try:
+    items = ast.literal_eval(sys.stdin.read().strip())
+except Exception:
+    items = []
+def xdg(k):
+    try:
+        return subprocess.check_output(["xdg-user-dir", k], text=True).strip()
+    except Exception:
+        return ""
+m = {"$HOME": os.path.expanduser("~"),
+     "$TRASH": os.path.expanduser("~/.local/share/Trash"),
+     "$DESKTOP": xdg("DESKTOP"), "$DOCUMENTS": xdg("DOCUMENTS"),
+     "$DOWNLOAD": xdg("DOWNLOAD"), "$MUSIC": xdg("MUSIC"),
+     "$PICTURES": xdg("PICTURES"), "$VIDEOS": xdg("VIDEOS"),
+     "$TEMPLATES": xdg("TEMPLATES"), "$PUBLIC_SHARE": xdg("PUBLIC_SHARE"),
+     "$NET": xdg("NET")}
+seen = set()
+for it in items:
+    if it in m:
+        p = m[it]
+    elif it.startswith("$"):
+        p = os.path.expanduser("~/" + it[1:])
+    else:
+        p = it
+    if p and p not in seen:
+        seen.add(p)
+        print(p)
+'
+}
+
+resolve_settings() {  # sets URI REPO HOST GDIR
+    local backend uri folder scheme
+    backend=$(gsettings get "$GS_HOME" backend | tr -d "'")
+    uri=$(gsettings get "$GS_HOME.${backend^}" uri | tr -d "'")
+    folder=$(gsettings get "$GS_HOME.${backend^}" folder | tr -d "'")
+    [ -n "$uri" ] || die "backend '$backend' has no URI set in Deja Dup"
+    URI="$uri"
+    # parse the URI
+    IFS='|' read -r scheme host user port <<<"$(printf '%s' "$uri" | python3 -c '
+import sys, urllib.parse
+p = urllib.parse.urlparse(sys.stdin.read().strip())
+print(p.scheme or "", p.hostname or "", p.username or "", p.port or 0, sep="|")')"
+    scheme=${scheme:-ftp}; host=${host:-localhost}
+    # sbd ( smb/nfs/ssh/ftp ... ) gvfs mount dir, e.g. ftp:host=1.2.3.4
+    local gvfs_base="/run/user/$(id -u)/gvfs"
+    if [ -n "$user" ]; then
+        GDIR=$(ls -1 "$gvfs_base" 2>/dev/null | grep -F "user=$user@host=$host" | head -1 || true)
+    fi
+    [ -n "${GDIR:-}" ] || GDIR=$(ls -1 "$gvfs_base" 2>/dev/null | grep -F "host=$host" | head -1 || true)
+    if [ -z "${GDIR:-}" ]; then
+        echo "deja-watch: gvfs mount for $uri not present — mounting…" >&2
+        gio mount "$uri" 2>&2 || gio mount "ftp://$host" || die "could not mount $uri"
+        local i
+        for i in $(seq 1 30); do
+            sleep 1
+            GDIR=$(ls -1 "$gvfs_base" 2>/dev/null | grep -F "host=$host" | head -n1 || true)
+            [ -n "$GDIR" ] && break
+        done
+        [ -n "$GDIR" ] || die "gvfs mount for $host did not appear in $gvfs_base"
+    fi
+    # expand markers such as $HOSTNAME in the folder spec
+    folder=${folder/'$HOSTNAME'/"$(hostname)"}
+    REPO="$gvfs_base/$GDIR$(printf '%s' "$folder" | sed 's:/*$::')"
+}
+
+restic_cmd() {  # restic with the right repo + password options
+    local pw=()
+    if [ -z "${DEJA_WATCH_PASSWORD:-}${RESTIC_PASSWORD:-}" ]; then
+        pw=(--insecure-no-password)
+    fi
+    restic --repo="$REPO" "${pw[@]}" "$@"
+}
+
+fmt_gib() { python3 - "$1" <<'EOF'
+import sys
+n = float(sys.argv[1])
+for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+    if n < 1024 or unit == "TiB":
+        print(f"{n:,.1f} {unit}"); break
+    n /= 1024
+EOF
+}
+
+snapshots_json() { restic_cmd snapshots --json; }  # piped to caller
+
+snapshot_excludes() {  # echo the exclude patterns recorded in the latest snapshot
+    snapshots_json | python3 -c '
+import sys, json
+s = json.loads(sys.stdin.read())
+if s:
+    latest = max(s, key=lambda x: x["time"])
+    for e in latest.get("excludes") or []:
+        print(e)
+'
+}
+
+# ------------------------------------------------------------------ stages ---
+
+cmd_status() {
+    resolve_settings
+    echo "Deja Dup monitor"
+    echo
+    echo "  backend URI : $URI"
+    echo "  gvfs mount  : $GDIR"
+    echo "  repository  : $REPO"
+    echo
+    echo "Last 5 snapshots (all times UTC):"
+    restic_cmd snapshots --compact
+}
+
+cmd_scan() {  # stage 1 — scanning, no writes
+    resolve_settings
+    echo "== Stage 1 — Scanning (restic --dry-run: nothing will be written) =="
+    echo; echo "  Include (from Deja Dup gsettings):"
+    gs_list include-list | sed 's/^/    /'
+    echo "  Exclude (gsettings + Deja Dup's built-ins, as recorded in last snapshot):"
+    snapshot_excludes | sort -u | sed 's/^/    /'
+    echo
+    local excludes=()
+    while IFS= read -r e; do excludes+=(--exclude "$e"); done < <(snapshot_excludes)
+    local includes=()
+    while IFS= read -r i; do includes+=("$i"); done < <(gs_list include-list)
+    restic_cmd backup --dry-run "${excludes[@]}" "${includes[@]}" "${EXTRA[@]}"
+}
+
+cmd_live() {  # stage 1+2 — real verbose backup
+    resolve_settings
+    echo "== Stages 1+2 — Backing up (verbose, real run) =="
+    echo "NOTE: this creates a real snapshot in the same repository Deja Dup"
+    echo "      manages. It will be aged out and pruned per your 90-day policy."
+    echo
+    if [ -t 0 ]; then
+        read -r -p "Continue? [y/N] " reply
+        case "$reply" in y|Y|yes|YES) ;; *) echo "aborted."; exit 0;; esac
+    fi
+    local excludes=()
+    while IFS= read -r e; do excludes+=(--exclude "$e"); done < <(snapshot_excludes)
+    local includes=()
+    while IFS= read -r i; do includes+=("$i"); done < <(gs_list include-list)
+    restic_cmd backup --tag deja-dup --tag deja-watch \
+        "${excludes[@]}" "${includes[@]}" "${EXTRA[@]}"
+    echo
+    echo "Done. The changed-files report is:"
+    echo "  deja-watch diff"
+}
+
+cmd_diff() {  # stage 3 — changed files between snapshots
+    resolve_settings
+    local n="${1:-1}"
+    mapfile -t IDS < <(snapshots_json | python3 -c '
+import sys, json
+s = json.loads(sys.stdin.read())
+for x in sorted(s, key=lambda i: i["time"]):
+    print(x["short_id"])
+')
+    [ "${#IDS[@]}" -ge 2 ] || die "need at least 2 snapshots for a diff"
+    local older=""; local newer="${IDS[-1]}"
+    case "$n" in
+        ''|*[!0-9]*) die "diff expects a number (steps back) or nothing" ;;
+        *) if [ "$n" -lt 1 ]; then die "n must be >= 1"; fi ;;
+    esac
+    if [ "$n" -gt "$((${#IDS[@]} - 1))" ]; then die "only $((${#IDS[@]} - 1)) older snapshot(s) available"; fi
+    older="${IDS[-$((n + 1))]}"
+    echo "== Stage 3 — Changed files: $older -> $newer =="
+    echo
+    restic_cmd diff "$older" "$newer" | python3 -c '
+import sys, re
+groups = {"M": [], "+": [], "-": [], "T": []}
+foot  = []
+for line in sys.stdin:
+    line = line.rstrip()
+    m = re.match(r"^([M+T\-])\s{2,}(\S.*)$", line)
+    if m and not re.match(r"(Added|Removed|Files|Dirs|Others|Data|Tree)", line):
+        sym, path = m.groups()
+        groups.setdefault(sym, []).append(path if path.endswith("/") else path + "")
+    else:
+        foot.append(line)
+titles = {"M": "MODIFIED", "+": "ADDED", "-": "REMOVED", "T": "TYPE-CHANGED"}
+order = ["M", "T", "+", "-"]
+total = 0
+for sym in order:
+    if groups[sym]:
+        total += len(groups[sym])
+        print(f"--- {titles[sym]} ({len(groups[sym])}) ---")
+        for p in groups[sym]:
+            print("  " + p)
+        print()
+print("Summary line as reported by restic:")
+for f in foot:
+    if f.strip():
+        print("  " + f)
+if total == 0:
+    print("(no individual files changed — maybe only metadata moved)")
+'
+}
+
+cmd_history() {
+    resolve_settings
+    restic_cmd snapshots --compact | tail -$(( ${1:-8} + 2 ))
+}
+
+cmd_tap() {  # what is a scheduled Deja Dup run doing right now?
+    resolve_settings
+    local log="$HOME/.cache/deja-dup/restic.log"
+    echo "Watching $log for the exact restic command Deja Dup executes…"
+    echo "(Deja Dup rewrites this file for each phase it runs: check, backup, forget…)"
+    echo "Press Ctrl-C to stop watching. Nothing is changed by this."
+    local last=""
+    while true; do
+        if [ -f "$log" ]; then
+            local cmd
+            cmd=$(grep -m1 "^Running the following tool" "$log" 2>/dev/null || true)
+            if [ -n "$cmd" ] && [ "$cmd" != "$last" ]; then
+                last="$cmd"
+                echo
+                echo "[$(date +%H:%M:%S)] $cmd"
+                sed -n '2p' "$log" 2>/dev/null | sed 's/^/               /'
+            fi
+        fi
+        sleep 2
+    done
+}
+
+cmd_env() {
+    resolve_settings
+    echo "URI            : $URI"
+    echo "gvfs mount dir : $GDIR"
+    echo "REPO           : $REPO"
+    echo "include-list   :"; gs_list include-list | sed 's/^/    /'
+    echo "exclude-list   :"; gs_list exclude-list | sed 's/^/    /'
+    echo "restic         : $(restic version 2>/dev/null | head -1)"
+}
+
+# -------------------------------------------------------------------- main ---
+
+[ -n "$1" ] || exec "$0" help
+command="$1"; shift || true
+EXTRA=("$@")
+case "$command" in
+    status)   cmd_status ;;
+    scan)     cmd_scan ;;
+    live)     cmd_live ;;
+    diff)     cmd_diff "${EXTRA[0]:-1}" ;;
+    history)  cmd_history "${EXTRA[0]:-8}" ;;
+    tap)      cmd_tap ;;
+    env)      cmd_env ;;
+    help|-h|--help) sed -n '2,30p' "$0" ;;
+    *) die "unknown command '$command' — try 'deja-watch help'" ;;
+esac

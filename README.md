@@ -52,7 +52,7 @@ deja-watch live --exclude '*.vdi'
 - A working Deja Dup backup configuration (run a backup once first so the
   repository exists)
 - `bash`, `python3`, `gsettings` (any modern GNOME-based desktop has these)
-- For remote backends (IP servers, cloud storage), the gvfs mount —
+- For remote backends (FTP, SMB, SSH, cloud storage), the gvfs mount —
   `deja-watch` triggers it automatically when needed
 
 ## Install
@@ -100,7 +100,7 @@ default for this path), then run `deja-watch help`.
 - NAS backend `ftp://` via gvfs FUSE
 
 `scan`, `diff`, `status`, `history`, `tap` and `env` verified against a live
-210 GB-class repository; `live` shares the same argument path as `scan`.
+~150 GiB repository; `live` verified with a real backup run.
 
 ## Status
 
